@@ -85,6 +85,12 @@ public class Keychain
     @KeychainItem(key: "deviceUDID")
     public var deviceUDID: String?
 
+    @KeychainItem(key: "nonameDeploymentToken")
+    public var nonameDeploymentToken: String?
+
+    @KeychainItem(key: "nonameDeploymentDeviceID")
+    public var nonameDeploymentDeviceID: String?
+
     // MARK: - Dynamic Imported Certificates Storage
 
     public subscript(certificateSerial serial: String) -> Data? {

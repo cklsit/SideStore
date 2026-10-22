@@ -141,6 +141,7 @@
 		<string>_mqtt._tcp</string>
 		<string>_adb._tcp</string>
 		<string>_airdrop._tcp</string>
+		<string>_noname-deploy._tcp</string>
 		<string>_sidecar._tcp</string>
 		<string>_sonos._tcp</string>
 		<string>_plex._tcp</string>

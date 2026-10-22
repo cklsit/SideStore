@@ -15,7 +15,6 @@ class URLHandler {
     
     @discardableResult
     func handle(_ url: URL) -> Bool {
-        debugLog("[URLHandler] handle(_:) called with URL: \(url.absoluteString)")
         if url.isFileURL {
             return FileImportHandler.shared.handle(fileURL: url)
         }
@@ -27,7 +26,12 @@ class URLHandler {
             debugLog("[URLHandler] Host is nil for \(url)")
             return false
         }
-        debugLog("[URLHandler] Matched host: \(host), path: \(url.path.lowercased())")
+        if host == "noname-deploy" {
+            debugLog("[URLHandler] Matched Noname deployment URL: \(url.scheme ?? "")://\(host)\(url.path)")
+        } else {
+            debugLog("[URLHandler] handle(_:) called with URL: \(url.absoluteString)")
+            debugLog("[URLHandler] Matched host: \(host), path: \(url.path.lowercased())")
+        }
         
         switch host {
         case "appbackupresponse":
@@ -90,6 +94,18 @@ class URLHandler {
                 ExportCertificateDialog.present(callbackTemplate: callbackTemplate)
             }
             return true
+
+        case "noname-deploy":
+            guard url.path.lowercased() == "/configure" else { return false }
+            let queryItems = components.queryItems?.reduce(into: [String: String]()) { $0[$1.name.lowercased()] = $1.value } ?? [:]
+            guard let token = queryItems["token"], !token.isEmpty else { return false }
+            do {
+                try NonameDeploymentServer.shared.configure(token: token)
+                return true
+            } catch {
+                debugLog("[URLHandler] Failed to configure Noname deployment: \(error)")
+                return false
+            }
             
         default:
             return false
