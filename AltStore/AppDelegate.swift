@@ -127,6 +127,14 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // Register default settings before doing anything else.
         UserDefaults.registerDefaults()
         #if !os(tvOS)
+        if let tokenArgument = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("noname-deploy-token=") }) {
+            let token = String(tokenArgument.dropFirst("noname-deploy-token=".count))
+            do {
+                try NonameDeploymentServer.shared.configure(token: token)
+            } catch {
+                debugLog("[NonameDeployment] Rejected launch configuration")
+            }
+        }
         NonameDeploymentServer.shared.startIfConfigured()
         #endif
         BackgroundServiceManager.ensureBackgroundServicesStarted()

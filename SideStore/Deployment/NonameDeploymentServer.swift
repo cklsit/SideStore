@@ -55,8 +55,8 @@ private enum NonameDeploymentError: LocalizedError {
     }
 }
 
-/// Authenticated, local-network-only deployment endpoint used by the self-hosted
-/// macOS runner to uninstall and reinstall the Noname IPA.
+/// Authenticated, local-network-only deployment endpoint used by the trusted
+/// LAN runner to uninstall and reinstall the Noname IPA.
 @MainActor
 final class NonameDeploymentServer {
     static let shared = NonameDeploymentServer()
@@ -203,26 +203,31 @@ final class NonameDeploymentServer {
                     )
                 )
             } catch {
-                sendError(connection, status: 400, message: error.localizedDescription)
+                sendError(connection, status: statusCode(for: error), message: error.localizedDescription)
             }
 
         default:
             if request.method == "GET", request.path.hasPrefix("/v1/jobs/") {
-                let jobID = String(request.path.dropFirst("/v1/jobs/".count))
-                if let job = jobs[jobID] {
-                    send(
-                        connection,
-                        status: 200,
-                        payload: NonameDeploymentResponse(
-                            ok: true,
-                            deviceID: deviceID,
-                            jobID: jobID,
-                            status: job.status,
-                            message: job.message
+                do {
+                    try authenticate(request)
+                    let jobID = String(request.path.dropFirst("/v1/jobs/".count))
+                    if let job = jobs[jobID] {
+                        send(
+                            connection,
+                            status: 200,
+                            payload: NonameDeploymentResponse(
+                                ok: true,
+                                deviceID: deviceID,
+                                jobID: jobID,
+                                status: job.status,
+                                message: job.message
+                            )
                         )
-                    )
-                } else {
-                    sendError(connection, status: 404, message: "unknown job")
+                    } else {
+                        sendError(connection, status: 404, message: "unknown job")
+                    }
+                } catch {
+                    sendError(connection, status: statusCode(for: error), message: error.localizedDescription)
                 }
             } else {
                 sendError(connection, status: 404, message: "not found")
@@ -295,7 +300,10 @@ final class NonameDeploymentServer {
     private func performDeployment(jobID: String, request: NonameDeploymentRequest) async {
         jobs[jobID] = NonameDeploymentJob(status: "running", message: "starting")
         let backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "NonameDeployment")
+        let idleTimerWasDisabled = UIApplication.shared.isIdleTimerDisabled
+        UIApplication.shared.isIdleTimerDisabled = true
         defer {
+            UIApplication.shared.isIdleTimerDisabled = idleTimerWasDisabled
             if backgroundTask != .invalid {
                 UIApplication.shared.endBackgroundTask(backgroundTask)
             }
@@ -339,7 +347,11 @@ final class NonameDeploymentServer {
             if let installedApp {
                 try await deleteManagedApp(installedApp)
             } else {
-                try await removeApp(request.bundleID)
+                do {
+                    try await removeApp(request.bundleID)
+                } catch where Self.isApplicationNotInstalled(error) {
+                    debugLog("[NonameDeployment] target app was not installed")
+                }
             }
 
             jobs[jobID] = NonameDeploymentJob(status: "running", message: "installing IPA")
@@ -397,6 +409,20 @@ final class NonameDeploymentServer {
         )
     }
 
+    private func statusCode(for error: Error) -> Int {
+        guard let deploymentError = error as? NonameDeploymentError else {
+            return 400
+        }
+        switch deploymentError {
+        case .unauthorized, .disabled:
+            return 401
+        case .busy:
+            return 409
+        case .invalidRequest, .invalidDigest, .unsupportedBundle:
+            return 400
+        }
+    }
+
     private func send<T: Encodable>(_ connection: NWConnection, status: Int, payload: T) {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -440,6 +466,13 @@ final class NonameDeploymentServer {
             difference |= lhs[index] ^ rhs[index]
         }
         return difference == 0
+    }
+
+    private static func isApplicationNotInstalled(_ error: Error) -> Bool {
+        let message = error.localizedDescription.lowercased()
+        return message.contains("not installed")
+            || message.contains("applicationnotinstalled")
+            || message.contains("no such application")
     }
 
     private static func parseHTTPRequest(_ data: Data) -> NonameHTTPRequest? {
