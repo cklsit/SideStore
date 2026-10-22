@@ -126,7 +126,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         
         // Register default settings before doing anything else.
         UserDefaults.registerDefaults()
+        #if !os(tvOS)
         NonameDeploymentServer.shared.startIfConfigured()
+        #endif
         BackgroundServiceManager.ensureBackgroundServicesStarted()
         syncMinimuxerBackendFromUserDefaults()
 
