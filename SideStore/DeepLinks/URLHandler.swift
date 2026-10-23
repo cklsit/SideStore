@@ -64,11 +64,27 @@ class URLHandler {
             guard let downloadURLString = queryItems["url"], let downloadURL = URL(string: downloadURLString) else { return false }
 
             if queryItems["auto"] == "1" {
-                AppManager.shared.install(.url(downloadURL), presentingViewController: nil) { result in
-                    switch result {
-                    case .success(let installedApp):
-                        debugLog("[URLHandler] Automatic install completed: \(installedApp.bundleIdentifier)")
-                    case .failure(let error):
+                Task {
+                    do {
+                        let (temporaryURL, response) = try await URLSession.shared.download(from: downloadURL)
+                        if let response = response as? HTTPURLResponse, !(200...299).contains(response.statusCode) {
+                            throw URLError(.badServerResponse)
+                        }
+                        let ipaURL = FileManager.default.temporaryDirectory
+                            .appendingPathComponent(UUID().uuidString)
+                            .appendingPathExtension("ipa")
+                        try FileManager.default.moveItem(at: temporaryURL, to: ipaURL)
+
+                        AppManager.shared.install(.url(ipaURL), presentingViewController: nil) { result in
+                            try? FileManager.default.removeItem(at: ipaURL)
+                            switch result {
+                            case .success(let installedApp):
+                                debugLog("[URLHandler] Automatic install completed: \(installedApp.bundleIdentifier)")
+                            case .failure(let error):
+                                debugLog("[URLHandler] Automatic install failed: \(error)")
+                            }
+                        }
+                    } catch {
                         debugLog("[URLHandler] Automatic install failed: \(error)")
                     }
                 }
