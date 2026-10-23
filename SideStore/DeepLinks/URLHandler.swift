@@ -74,7 +74,11 @@ class URLHandler {
                 }
             } else {
                 Task {
-                    NotificationCenter.default.post(AppDelegate.importAppDeepLinkNotification, object: nil, userInfo: [AppDelegate.importAppDeepLinkURLKey: downloadURL])
+                    NotificationCenter.default.post(
+                        name: AppDelegate.importAppDeepLinkNotification,
+                        object: nil,
+                        userInfo: [AppDelegate.importAppDeepLinkURLKey: downloadURL]
+                    )
                 }
             }
             return true
