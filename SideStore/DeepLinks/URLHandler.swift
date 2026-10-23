@@ -62,9 +62,20 @@ class URLHandler {
         case "install":
             let queryItems = components.queryItems?.reduce(into: [String: String]()) { $0[$1.name.lowercased()] = $1.value } ?? [:]
             guard let downloadURLString = queryItems["url"], let downloadURL = URL(string: downloadURLString) else { return false }
-            
-            Task {
-                NotificationCenter.default.post(name: AppDelegate.importAppDeepLinkNotification, object: nil, userInfo: [AppDelegate.importAppDeepLinkURLKey: downloadURL])
+
+            if queryItems["auto"] == "1" {
+                AppManager.shared.install(.url(downloadURL), presentingViewController: nil) { result in
+                    switch result {
+                    case .success(let installedApp):
+                        debugLog("[URLHandler] Automatic install completed: \(installedApp.bundleIdentifier)")
+                    case .failure(let error):
+                        debugLog("[URLHandler] Automatic install failed: \(error)")
+                    }
+                }
+            } else {
+                Task {
+                    NotificationCenter.default.post(AppDelegate.importAppDeepLinkNotification, object: nil, userInfo: [AppDelegate.importAppDeepLinkURLKey: downloadURL])
+                }
             }
             return true
             
