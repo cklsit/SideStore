@@ -144,7 +144,10 @@ private extension BackgroundTaskManager
 
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
-        engine.mainMixerNode.outputVolume = 0.0
+        // The mixer volume stays at its default: the buffer is already all zeros,
+        // so the output is silent anyway, while a zero mixer volume could make the
+        // engine (or the system) treat the session as "not rendering audio" and
+        // weaken the very keep-alive this class exists for.
 
         do
         {

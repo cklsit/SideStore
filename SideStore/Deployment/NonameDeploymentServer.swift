@@ -63,6 +63,10 @@ private enum NonameDeploymentError: LocalizedError {
 /// It owns a delayed stop: the runner still polls the final job state after the
 /// installation finishes, so playback must survive the end of the job for a
 /// while. Starting again cancels a pending stop.
+///
+/// Call start/stop/cancelScheduledStop only from the main thread or from outside
+/// this object's own `queue`: they take `queue.sync`, so calling them from a
+/// block that already runs on `queue` would deadlock.
 private final class NonameExtendedBackgroundTask: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.sidestore.noname.background")
     private var stopGeneration = 0
