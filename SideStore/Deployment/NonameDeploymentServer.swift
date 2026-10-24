@@ -55,6 +55,37 @@ private enum NonameDeploymentError: LocalizedError {
     }
 }
 
+private final class NonameExtendedBackgroundTask {
+    private var finishHandler: (() -> Void)?
+
+    var isActive: Bool {
+        finishHandler != nil
+    }
+
+    func start() {
+        guard finishHandler == nil else { return }
+        BackgroundTaskManager.shared.performExtendedBackgroundTask { result, finish in
+            switch result {
+            case .success:
+                self.finishHandler = finish
+                debugLog("[NonameDeployment] silent-audio background task started")
+            case .failure(let error):
+                finish()
+                debugLog("[NonameDeployment] silent-audio background task failed: \(error)")
+            }
+        }
+    }
+
+    func stop() {
+        finishHandler?()
+        finishHandler = nil
+    }
+
+    deinit {
+        stop()
+    }
+}
+
 /// Authenticated, local-network-only deployment endpoint used by the trusted
 /// LAN runner to uninstall and reinstall the Noname IPA.
 @MainActor
@@ -73,6 +104,7 @@ final class NonameDeploymentServer {
     private var jobs: [String: NonameDeploymentJob] = [:]
     private var usedNonces: [String: Date] = [:]
     private var deploymentTask: Task<Void, Never>?
+    private var deploymentBackgroundTask: NonameExtendedBackgroundTask?
 
     private init() {}
 
@@ -289,9 +321,14 @@ final class NonameDeploymentServer {
 
         let jobID = UUID().uuidString.lowercased()
         jobs[jobID] = NonameDeploymentJob(status: "queued", message: nil)
+        let backgroundTask = NonameExtendedBackgroundTask()
+        backgroundTask.start()
+        deploymentBackgroundTask = backgroundTask
         deploymentTask = Task { [weak self] in
             guard let self else { return }
             await self.performDeployment(jobID: jobID, request: request)
+            self.deploymentBackgroundTask?.stop()
+            self.deploymentBackgroundTask = nil
             self.deploymentTask = nil
         }
         return jobID
