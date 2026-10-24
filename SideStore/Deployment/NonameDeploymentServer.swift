@@ -15,6 +15,8 @@ private struct NonameDeploymentResponse: Encodable {
     let jobID: String?
     let status: String?
     let message: String?
+    let backgroundActive: Bool?
+    let audioActive: Bool?
 }
 
 private struct NonameDeploymentJob {
@@ -55,6 +57,54 @@ private enum NonameDeploymentError: LocalizedError {
     }
 }
 
+/// Thin wrapper around the silent-audio keep-alive used while a deployment runs
+/// with the screen off.
+///
+/// It owns a delayed stop: the runner still polls the final job state after the
+/// installation finishes, so playback must survive the end of the job for a
+/// while. Starting again cancels a pending stop.
+private final class NonameExtendedBackgroundTask: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.sidestore.noname.background")
+    private var stopGeneration = 0
+
+    var isActive: Bool {
+        BackgroundTaskManager.shared.isRunning
+    }
+
+    func start() {
+        self.cancelScheduledStop()
+        do {
+            try BackgroundTaskManager.shared.start()
+        } catch {
+            debugLog("[NonameDeployment] silent-audio background task failed: \(error)")
+        }
+    }
+
+    func scheduleStop(after delay: TimeInterval) {
+        queue.async {
+            self.stopGeneration += 1
+            let generation = self.stopGeneration
+            self.queue.asyncAfter(deadline: .now() + delay) {
+                guard self.stopGeneration == generation else { return }
+                self.stopGeneration += 1
+                BackgroundTaskManager.shared.stop()
+                debugLog("[NonameDeployment] silent-audio background task stopped after the job finished")
+            }
+        }
+    }
+
+    func cancelScheduledStop() {
+        queue.sync {
+            self.stopGeneration += 1
+        }
+    }
+
+    func stop() {
+        self.cancelScheduledStop()
+        BackgroundTaskManager.shared.stop()
+    }
+}
+
 /// Authenticated, local-network-only deployment endpoint used by the trusted
 /// LAN runner to uninstall and reinstall the Noname IPA.
 @MainActor
@@ -65,6 +115,10 @@ final class NonameDeploymentServer {
     static let serviceType = "_noname-deploy._tcp"
     static let allowedBundleIDs: Set<String> = ["com.libnoname.noname"]
 
+    /// How long the silent-audio keep-alive survives after a job finishes. The
+    /// runner needs this window to collect the final job state.
+    private static let backgroundStopDelay: TimeInterval = 90
+
     private let queue = DispatchQueue(label: "com.sidestore.noname.deployment")
     private let maxRequestBytes = 64 * 1024
     private let maxTimestampSkew: TimeInterval = 300
@@ -73,6 +127,7 @@ final class NonameDeploymentServer {
     private var jobs: [String: NonameDeploymentJob] = [:]
     private var usedNonces: [String: Date] = [:]
     private var deploymentTask: Task<Void, Never>?
+    private let backgroundTask = NonameExtendedBackgroundTask()
 
     private init() {}
 
@@ -96,11 +151,18 @@ final class NonameDeploymentServer {
         }
         Keychain.shared.nonameDeploymentToken = token
         start()
+
+        // Configured by the runner, so keep the host awake from now on and drop
+        // any stop that a previous job scheduled.
+        backgroundTask.start()
+        debugLog("[NonameDeployment] configured; backgroundActive=\(backgroundTask.isActive)")
     }
 
     func startIfConfigured() {
         guard isConfigured else { return }
         start()
+        backgroundTask.start()
+        debugLog("[NonameDeployment] started if configured; backgroundActive=\(backgroundTask.isActive)")
     }
 
     func start() {
@@ -174,6 +236,9 @@ final class NonameDeploymentServer {
     private func handle(_ request: NonameHTTPRequest, connection: NWConnection) {
         switch (request.method, request.path) {
         case ("GET", "/v1/hello"):
+            // Unauthenticated liveness probe: also the cheapest place to pull a
+            // suspended silent-audio loop back up.
+            BackgroundTaskManager.shared.ensureRunning()
             send(
                 connection,
                 status: 200,
@@ -182,9 +247,34 @@ final class NonameDeploymentServer {
                     deviceID: deviceID,
                     jobID: nil,
                     status: deploymentTask == nil ? "idle" : "busy",
-                    message: nil
+                    message: nil,
+                    backgroundActive: backgroundTask.isActive,
+                    audioActive: backgroundTask.isActive
                 )
             )
+
+        case ("GET", "/v1/keepalive"):
+            do {
+                try authenticate(request)
+                BackgroundTaskManager.shared.ensureRunning()
+                let audioActive = backgroundTask.isActive
+                debugLog("[NonameDeployment] keepalive requested; backgroundActive=\(audioActive)")
+                send(
+                    connection,
+                    status: 200,
+                    payload: NonameDeploymentResponse(
+                        ok: true,
+                        deviceID: deviceID,
+                        jobID: nil,
+                        status: deploymentTask == nil ? "idle" : "busy",
+                        message: audioActive ? "audio running" : "audio unavailable",
+                        backgroundActive: audioActive,
+                        audioActive: audioActive
+                    )
+                )
+            } catch {
+                sendError(connection, status: statusCode(for: error), message: error.localizedDescription)
+            }
 
         case ("POST", "/v1/deploy"):
             do {
@@ -199,7 +289,9 @@ final class NonameDeploymentServer {
                         deviceID: deviceID,
                         jobID: jobID,
                         status: "queued",
-                        message: nil
+                        message: nil,
+                        backgroundActive: backgroundTask.isActive,
+                        audioActive: backgroundTask.isActive
                     )
                 )
             } catch {
@@ -210,6 +302,7 @@ final class NonameDeploymentServer {
             if request.method == "GET", request.path.hasPrefix("/v1/jobs/") {
                 do {
                     try authenticate(request)
+                    BackgroundTaskManager.shared.ensureRunning()
                     let jobID = String(request.path.dropFirst("/v1/jobs/".count))
                     if let job = jobs[jobID] {
                         send(
@@ -220,7 +313,9 @@ final class NonameDeploymentServer {
                                 deviceID: deviceID,
                                 jobID: jobID,
                                 status: job.status,
-                                message: job.message
+                                message: job.message,
+                                backgroundActive: backgroundTask.isActive,
+                                audioActive: backgroundTask.isActive
                             )
                         )
                     } else {
@@ -289,23 +384,36 @@ final class NonameDeploymentServer {
 
         let jobID = UUID().uuidString.lowercased()
         jobs[jobID] = NonameDeploymentJob(status: "queued", message: nil)
+
+        // Keep the host alive for the whole job, and cancel a stop scheduled by a
+        // previous job that may still be pending.
+        backgroundTask.start()
+        debugLog("[NonameDeployment] enqueued \(jobID); backgroundActive=\(backgroundTask.isActive)")
+
         deploymentTask = Task { [weak self] in
             guard let self else { return }
             await self.performDeployment(jobID: jobID, request: request)
             self.deploymentTask = nil
+            // Do not cut the audio immediately: the runner still polls the final
+            // state, and a short grace window also covers the case where iOS
+            // suspends the app right after the install finishes.
+            self.backgroundTask.scheduleStop(after: Self.backgroundStopDelay)
+            debugLog("[NonameDeployment] finished \(jobID); keep-alive stops in \(Int(Self.backgroundStopDelay))s")
         }
         return jobID
     }
 
     private func performDeployment(jobID: String, request: NonameDeploymentRequest) async {
         jobs[jobID] = NonameDeploymentJob(status: "running", message: "starting")
-        let backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "NonameDeployment")
+        // Named uiBackgroundTask so it is not confused with the silent-audio
+        // keep-alive wrapper, which is a property of this server.
+        let uiBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "NonameDeployment")
         let idleTimerWasDisabled = UIApplication.shared.isIdleTimerDisabled
         UIApplication.shared.isIdleTimerDisabled = true
         defer {
             UIApplication.shared.isIdleTimerDisabled = idleTimerWasDisabled
-            if backgroundTask != .invalid {
-                UIApplication.shared.endBackgroundTask(backgroundTask)
+            if uiBackgroundTask != .invalid {
+                UIApplication.shared.endBackgroundTask(uiBackgroundTask)
             }
         }
 
@@ -404,7 +512,9 @@ final class NonameDeploymentServer {
                 deviceID: nil,
                 jobID: nil,
                 status: "error",
-                message: message
+                message: message,
+                backgroundActive: backgroundTask.isActive,
+                audioActive: backgroundTask.isActive
             )
         )
     }
