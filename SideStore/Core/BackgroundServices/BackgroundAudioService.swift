@@ -117,7 +117,11 @@ public final class BackgroundAudioService: BackgroundService, @unchecked Sendabl
         |          DataSize (16000)     | Zero Bytes (Pure Silence)...  |
         +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     */
-    private static func generateSilentWAV() -> Data {
+    /// Builds the in-memory silent WAV used by the background keep-alive.
+    ///
+    /// Internal so `BackgroundTaskManager` (the deployment keep-alive) can reuse
+    /// the exact same buffer instead of duplicating the header layout.
+    static func generateSilentWAV() -> Data {
         let sampleRate:    UInt32 = 8000
         let numChannels:   UInt16 = 1
         let bitsPerSample: UInt16 = 16

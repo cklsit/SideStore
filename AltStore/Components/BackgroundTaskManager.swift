@@ -9,45 +9,64 @@
 import AVFoundation
 import Foundation
 
-/// Keeps the app alive in the background by looping a silent audio buffer.
+/// Keeps the app alive in the background by looping a silent WAV.
 ///
-/// The previous implementation streamed `Bundle.main/Silence.m4a`. LiveContainer
-/// loads SideStore as a dylib, so `Bundle.main` points at the host app and that
-/// resource lookup is not dependable. The buffer is therefore generated in code
-/// instead, and playback can be started, stopped and re-checked repeatedly so the
-/// deployment endpoint can pull the keep-alive back up after iOS interrupts it.
+/// This mirrors the keep-alive that SideStore already ships in
+/// `BackgroundAudioService`, which is the implementation known to survive a
+/// locked screen:
+///
+/// * the WAV is generated in code, so no bundle resource is involved (LiveContainer
+///   loads SideStore as a dylib and `Bundle.main` points at the host app);
+/// * `AVAudioPlayer` with `numberOfLoops = -1` and a small non-zero `volume`,
+///   because a zero volume can look like "not rendering audio" to the system;
+/// * an interruption observer that resumes playback when iOS ends the interruption;
+/// * `isRunning` is `player?.isPlaying`, so callers always see the real state.
+///
+/// Unlike `BackgroundAudioService`, nothing here switches the user's background
+/// service mode or touches the location service.
 final class BackgroundTaskManager: @unchecked Sendable
 {
     static let shared = BackgroundTaskManager()
 
-    /// Length of the looped silent buffer in seconds.
-    private static let bufferDuration: Double = 1.0
-    private static let sampleRate: Double = 44100
-
     private let queue = DispatchQueue(label: "com.altstore.BackgroundTaskManager")
 
-    // Every access below happens on `queue`; `isRunning` reads it synchronously.
-    private var running = false
-    private var sessionIsActive = false
-    private var audioEngine: AVAudioEngine?
-    private var player: AVAudioPlayerNode?
-    private var silentBuffer: AVAudioPCMBuffer?
+    private var player: AVAudioPlayer?
+    private var interruptionObserver: (any NSObjectProtocol)?
 
-    private init() {}
+    private init()
+    {
+        self.interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleInterruption(notification)
+        }
+    }
 
-    /// Whether the silent-audio loop is currently playing. Thread safe.
-    var isRunning: Bool {
-        queue.sync { self.running }
+    deinit
+    {
+        if let interruptionObserver = self.interruptionObserver
+        {
+            NotificationCenter.default.removeObserver(interruptionObserver)
+        }
+        self.player?.stop()
+    }
+
+    /// Whether the silent loop is actually playing. Thread safe.
+    var isRunning: Bool
+    {
+        queue.sync { self.player?.isPlaying == true }
     }
 }
 
 extension BackgroundTaskManager
 {
-    /// Starts the silent-audio loop. Returns immediately when it already runs.
+    /// Starts the silent loop. Returns immediately when it already plays.
     func start() throws
     {
         try queue.sync {
-            guard !self.running else { return }
+            guard self.player?.isPlaying != true else { return }
             try self.startWhileLocked()
         }
     }
@@ -69,11 +88,22 @@ extension BackgroundTaskManager
         }
     }
 
-    /// Stops the loop and deactivates the audio session. Safe to call repeatedly.
+    /// Stops the loop. Safe to call repeatedly.
     func stop()
     {
         queue.sync {
-            self.stopWhileLocked()
+            guard self.player != nil else { return }
+
+            self.player?.stop()
+            self.player = nil
+
+            // The audio session is process-wide. Deactivating it while the
+            // optional BackgroundAudioService keep-alive is playing would silently
+            // disable that feature, so hand the session over instead.
+            if !BackgroundAudioService.shared.isRunning
+            {
+                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            }
         }
     }
 
@@ -100,114 +130,95 @@ extension BackgroundTaskManager
 
 private extension BackgroundTaskManager
 {
-    /// Builds and starts the engine. The caller must already hold `queue`.
+    /// Builds the player and starts playback. The caller must already hold `queue`.
     func startWhileLocked() throws
     {
+        // LiveContainer and SideStore share one process, and the app-wide
+        // background service may already be looping its own silent WAV. Stop it so
+        // a single keep-alive owns the session and the reported state stays
+        // truthful. Stopping it has no other side effect: unlike `start()`, its
+        // `stop()` does not switch the background service mode.
+        if BackgroundAudioService.shared.isRunning
+        {
+            BackgroundAudioService.shared.stop()
+            debugLog("Stopped BackgroundAudioService before taking over the audio session.")
+        }
+
         let session = AVAudioSession.sharedInstance()
-        do
-        {
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            try session.setActive(true)
-        }
-        catch
-        {
-            try? session.setActive(false, options: .notifyOthersOnDeactivation)
-            throw error
-        }
-        self.sessionIsActive = true
+        try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        try session.setActive(true)
 
-        guard
-            let format = AVAudioFormat(standardFormatWithSampleRate: Self.sampleRate, channels: 1),
-            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(Self.sampleRate * Self.bufferDuration))
-        else
+        // A player that went through an interruption may refuse to resume, so
+        // build a fresh one whenever playback is not actually running.
+        if self.player?.isPlaying != true
         {
-            try? session.setActive(false, options: .notifyOthersOnDeactivation)
-            self.sessionIsActive = false
-            throw BackgroundTaskManagerError.bufferUnavailable
-        }
+            self.player?.stop()
+            self.player = nil
 
-        buffer.frameLength = buffer.frameCapacity
-        // AVAudioPCMBuffer memory is not guaranteed to be zeroed, so fill the
-        // frames explicitly. This is what keeps the loop actually silent.
-        if let channels = buffer.floatChannelData
-        {
-            let frameCount = Int(buffer.frameLength)
-            let byteCount = frameCount * MemoryLayout<Float>.size
-            for channel in 0..<Int(buffer.format.channelCount)
+            do
             {
-                memset(channels[channel], 0, byteCount)
+                let player = try AVAudioPlayer(data: BackgroundAudioService.generateSilentWAV())
+                player.numberOfLoops = -1
+                player.volume = 0.01
+                _ = player.prepareToPlay()
+                self.player = player
+            }
+            catch
+            {
+                try? session.setActive(false, options: .notifyOthersOnDeactivation)
+                throw error
             }
         }
 
-        let engine = AVAudioEngine()
-        let player = AVAudioPlayerNode()
-
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-        // The mixer volume stays at its default: the buffer is already all zeros,
-        // so the output is silent anyway, while a zero mixer volume could make the
-        // engine (or the system) treat the session as "not rendering audio" and
-        // weaken the very keep-alive this class exists for.
-
-        do
+        guard self.player?.play() == true else
         {
-            try engine.start()
-            player.scheduleBuffer(buffer, at: nil, options: .loops)
-            player.play()
-        }
-        catch
-        {
-            player.stop()
-            engine.stop()
+            self.player = nil
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
-            self.sessionIsActive = false
-            throw error
+            throw BackgroundTaskManagerError.playbackFailed
         }
-
-        self.audioEngine = engine
-        self.player = player
-        self.silentBuffer = buffer
-        self.running = true
 
         debugLog("Silent-audio background task started.")
     }
 
-    /// Tears the engine down. The caller must already hold `queue`.
-    func stopWhileLocked()
+    /// Resumes playback after iOS ends an interruption.
+    func handleInterruption(_ notification: Notification)
     {
-        guard self.running || self.audioEngine != nil || self.sessionIsActive else { return }
-
-        self.player?.stop()
-        self.audioEngine?.stop()
-
-        // The audio session is process-wide. Deactivating it while the optional
-        // BackgroundAudioService keep-alive is playing would silently disable
-        // that feature, so hand the session over instead of tearing it down.
-        if self.sessionIsActive && !BackgroundAudioService.shared.isRunning
+        guard
+            let userInfo = notification.userInfo,
+            let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+            let type = AVAudioSession.InterruptionType(rawValue: typeValue),
+            type == .ended
+        else
         {
-            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            return
         }
-        self.sessionIsActive = false
 
-        self.player = nil
-        self.audioEngine = nil
-        self.silentBuffer = nil
-        self.running = false
-
-        debugLog("Silent-audio background task stopped.")
+        queue.sync {
+            guard let player = self.player else { return }
+            do
+            {
+                try AVAudioSession.sharedInstance().setActive(true)
+                _ = player.play()
+                debugLog("Silent-audio background task resumed after an interruption.")
+            }
+            catch
+            {
+                debugLog("Could not resume the silent-audio background task. \(error)")
+            }
+        }
     }
 }
 
 enum BackgroundTaskManagerError: LocalizedError
 {
-    case bufferUnavailable
+    case playbackFailed
 
     var errorDescription: String?
     {
         switch self
         {
-        case .bufferUnavailable:
-            return "Could not allocate the silent audio buffer"
+        case .playbackFailed:
+            return "Could not start silent audio playback"
         }
     }
 }
