@@ -133,17 +133,12 @@ private extension BackgroundTaskManager
     /// Builds the player and starts playback. The caller must already hold `queue`.
     func startWhileLocked() throws
     {
-        // LiveContainer and SideStore share one process, and the app-wide
-        // background service may already be looping its own silent WAV. Stop it so
-        // a single keep-alive owns the session and the reported state stays
-        // truthful. Stopping it has no other side effect: unlike `start()`, its
-        // `stop()` does not switch the background service mode.
-        if BackgroundAudioService.shared.isRunning
-        {
-            BackgroundAudioService.shared.stop()
-            debugLog("Stopped BackgroundAudioService before taking over the audio session.")
-        }
-
+        // Coexists with BackgroundAudioService on purpose: two AVAudioPlayers can
+        // share one audio session, and stopping that service here would silently
+        // switch off the background refresh keep-alive the user enabled (its
+        // interruption observer cannot recover once its player is nil). The only
+        // coordination needed is in `stop()`, which leaves the session active while
+        // the other service is still playing.
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
         try session.setActive(true)
