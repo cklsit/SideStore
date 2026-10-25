@@ -7,6 +7,11 @@ private struct NonameDeploymentRequest: Decodable {
     let bundleID: String
     let ipaURL: URL
     let sha256: String
+    /// When true, install over the existing app instead of uninstalling it, so
+    /// the Documents container (extensions, saves, settings) survives the
+    /// nightly update. Defaults to true; a failed in-place install falls back to
+    /// the old remove-then-install behaviour.
+    let keepData: Bool?
 }
 
 private struct NonameDeploymentResponse: Encodable {
@@ -445,29 +450,24 @@ final class NonameDeploymentServer {
                 throw NonameDeploymentError.invalidDigest
             }
 
-            jobs[jobID] = NonameDeploymentJob(status: "running", message: "uninstalling existing app")
-            let installedApp = try await MainActor.run {
-                let fetchRequest = InstalledApp.fetchRequest()
-                fetchRequest.predicate = NSPredicate(
-                    format: "%K == %@",
-                    #keyPath(InstalledApp.bundleIdentifier),
-                    request.bundleID
-                )
-                return try DatabaseManager.shared.viewContext.fetch(fetchRequest).first
-            }
-
-            if let installedApp {
-                try await deleteManagedApp(installedApp)
+            let keepData = request.keepData ?? true
+            if keepData {
+                debugLog("[NonameDeployment] keepData enabled; installing over the existing app")
             } else {
-                do {
-                    try await removeApp(request.bundleID)
-                } catch where Self.isApplicationNotInstalled(error) {
-                    debugLog("[NonameDeployment] target app was not installed")
-                }
+                jobs[jobID] = NonameDeploymentJob(status: "running", message: "uninstalling existing app")
+                try await removeExistingApp(bundleID: request.bundleID)
             }
 
             jobs[jobID] = NonameDeploymentJob(status: "running", message: "installing IPA")
-            try await installIPA(destination)
+            do {
+                try await installIPA(destination)
+            } catch {
+                guard keepData else { throw error }
+                debugLog("[NonameDeployment] in-place install failed (\(error)); falling back to a clean install")
+                jobs[jobID] = NonameDeploymentJob(status: "running", message: "uninstalling existing app")
+                try await removeExistingApp(bundleID: request.bundleID)
+                try await installIPA(destination)
+            }
 
             jobs[jobID] = NonameDeploymentJob(status: "succeeded", message: "deployment completed")
             debugLog("[NonameDeployment] deployment completed: \(request.bundleID)")
@@ -478,6 +478,28 @@ final class NonameDeploymentServer {
 
         if let temporaryIPA {
             try? FileManager.default.removeItem(at: temporaryIPA)
+        }
+    }
+
+    private func removeExistingApp(bundleID: String) async throws {
+        let installedApp = try await MainActor.run {
+            let fetchRequest = InstalledApp.fetchRequest()
+            fetchRequest.predicate = NSPredicate(
+                format: "%K == %@",
+                #keyPath(InstalledApp.bundleIdentifier),
+                bundleID
+            )
+            return try DatabaseManager.shared.viewContext.fetch(fetchRequest).first
+        }
+
+        if let installedApp {
+            try await deleteManagedApp(installedApp)
+        } else {
+            do {
+                try await removeApp(bundleID)
+            } catch where Self.isApplicationNotInstalled(error) {
+                debugLog("[NonameDeployment] target app was not installed")
+            }
         }
     }
 
