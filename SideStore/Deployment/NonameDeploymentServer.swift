@@ -448,10 +448,14 @@ final class NonameDeploymentServer {
             jobs[jobID] = NonameDeploymentJob(status: "running", message: "uninstalling existing app")
             let installedApp = try await MainActor.run {
                 let fetchRequest = InstalledApp.fetchRequest()
+                // SideStore re-signs the IPA with the user's team, so the installed
+                // bundle identifier may carry a ".TEAMID" suffix.
                 fetchRequest.predicate = NSPredicate(
-                    format: "%K == %@",
+                    format: "%K == %@ OR %K BEGINSWITH %@",
                     #keyPath(InstalledApp.bundleIdentifier),
-                    request.bundleID
+                    request.bundleID,
+                    #keyPath(InstalledApp.bundleIdentifier),
+                    request.bundleID + "."
                 )
                 return try DatabaseManager.shared.viewContext.fetch(fetchRequest).first
             }
@@ -461,8 +465,10 @@ final class NonameDeploymentServer {
             } else {
                 do {
                     try await removeApp(request.bundleID)
-                } catch where Self.isApplicationNotInstalled(error) {
-                    debugLog("[NonameDeployment] target app was not installed")
+                } catch {
+                    // The app may be installed under a team-suffixed identifier or
+                    // already gone; installing the IPA replaces it either way.
+                    debugLog("[NonameDeployment] removeApp skipped: \(error)")
                 }
             }
 
